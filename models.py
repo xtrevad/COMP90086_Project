@@ -18,70 +18,60 @@ import cv2
 
 
 class StabilityDataset(Dataset):
-    def __init__(self, csv_file, img_dir, transform=None, augment=False, image_size=224):
+    def __init__(self, csv_file, img_dir, transform=None, augment=False, use_quantized=False, is_test=False):
         self.stability_data = pd.read_csv(csv_file)
         self.img_dir = img_dir
         self.transform = transform
-        self.augment = augment
-        self.image_size = image_size
-        self.augmented_indices = self._create_augmented_indices() if augment else None
+        self.augment = augment and not is_test  # No augmentation for test data
+        self.use_quantized = use_quantized
+        self.is_test = is_test
+        self.image_files = self._get_image_files()
 
-    def _create_augmented_indices(self):
-        base_indices = list(range(len(self.stability_data)))
-        flipped_indices = [idx + len(self.stability_data) for idx in base_indices]
-        zoomed_indices = [idx + 2 * len(self.stability_data) for idx in base_indices]
-        zoomed_flipped_indices = [idx + 3 * len(self.stability_data) for idx in base_indices]
-        return base_indices + flipped_indices + zoomed_indices + zoomed_flipped_indices
+    def _get_image_files(self):
+        image_files = []
+        for idx, row in self.stability_data.iterrows():
+            img_name = str(row[0])
+            if self.use_quantized:
+                image_files.append(f"quantized/{img_name}_quantized.jpg")
+                if self.augment:
+                    image_files.extend([
+                        f"quantized/{img_name}_flipped_quantized.jpg",
+                        f"quantized/{img_name}_zoomed_quantized.jpg",
+                        f"quantized/{img_name}_zoomed_flipped_quantized.jpg"
+                    ])
+            else:
+                image_files.append(f"{img_name}_original.jpg")
+                if self.augment:
+                    image_files.extend([
+                        f"{img_name}_flipped.jpg",
+                        f"{img_name}_zoomed.jpg",
+                        f"{img_name}_zoomed_flipped.jpg"
+                    ])
+        return image_files
 
     def __len__(self):
-        return len(self.stability_data) * 4 if self.augment else len(self.stability_data)
+        return len(self.image_files)
 
     def __getitem__(self, idx):
-        if self.augment:
-            original_idx = idx % len(self.stability_data)
-            augmentation = idx // len(self.stability_data)
-        else:
-            original_idx = idx
-            augmentation = 0
-
-        img_name = str(self.stability_data.iloc[original_idx, 0])
+        img_name = self.image_files[idx]
         img_path = os.path.join(self.img_dir, img_name)
-        if not os.path.exists(img_path):
-            img_path = os.path.join(self.img_dir, f"{img_name}.jpg")
-        
-        image = Image.open(img_path).convert('RGB')
-        
-        stability_height = self.stability_data.iloc[original_idx, -1]
-        stability_class = int(stability_height) - 1
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        if self.augment:
-            if augmentation in [1, 3]:  # Flip
-                image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-            if augmentation in [2, 3]:  # Zoom
-                width, height = image.size
-                crop_size = int(min(width, height) * 0.8)  # Zoom in by 20%
-                left = (width - crop_size) // 2
-                top = (height - crop_size) // 2
-                right = left + crop_size
-                bottom = top + crop_size
-                image = image.crop((left, top, right, bottom))
-            if augmentation in [1, 2]:  # Quantise colours
-                open_cv_image = np.array(image)
-                open_cv_image = open_cv_image[:, :, ::-1].copy()  # convert to BGR
-                open_cv_image = colour_quantisation(open_cv_image, k=20)
-                # convert back to PIL image
-                open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2RGB)
-                image = Image.fromarray(open_cv_image)
+        if not self.is_test:
+            original_idx = idx // 4 if self.augment else idx
+            stability_height = self.stability_data.iloc[original_idx, -1]
+            stability_class = int(stability_height) - 1
+        else:
+            stability_class = -1  # Placeholder for test data
 
-        # Resize the image to ensure consistent size
-        image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        
         if self.transform:
             image = self.transform(image)
+        else:
+            image = torch.from_numpy(image.transpose((2, 0, 1))).float() / 255.0
 
         return image, torch.tensor(stability_class, dtype=torch.long)
-
-
+    
 class StabilityPredictor(nn.Module):
     def __init__(self, num_classes=6, dropout_rate=0.3):
         super(StabilityPredictor, self).__init__()
@@ -383,6 +373,7 @@ def train_and_save(config):
                                     img_dir=config['train_img_dir'], 
                                     transform=transforms.ToTensor(),
                                     augment=False,
+                                    use_quantized=config['use_quantized'],
                                     image_size=config['image_size'])
 
     # Split dataset into train and validation
@@ -422,6 +413,7 @@ def train_and_save(config):
                                      img_dir=config['train_img_dir'], 
                                      transform=train_transform,
                                      augment=config['use_augmentation'],
+                                     use_quantized=config['use_quantized'],
                                      image_size=config['image_size'])
     train_dataset = Subset(train_dataset, [i for i in range(len(train_dataset)) if i % len(full_dataset) in train_indices])
 
@@ -429,6 +421,7 @@ def train_and_save(config):
                                    img_dir=config['train_img_dir'], 
                                    transform=val_transform,
                                    augment=False,
+                                   use_quantized=config['use_quantized'],
                                    image_size=config['image_size'])
     val_dataset = Subset(val_dataset, val_indices)
 
@@ -449,17 +442,15 @@ def train_and_save(config):
     elif config['model'] == 'ConvnextPredictor':
         model = ConvnextPredictor(num_classes=config['num_classes'], freeze_layers=config['freeze_layers'])
         optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)  # Smaller LR + L2 regularisation for ConvNeXt
-    
-
     else:
         print('Unrecognised model in config. Defaulting to StabilityPredictor (EfficientNet)')
         model = StabilityPredictor(num_classes=config['num_classes'], dropout_rate=config['dropout_rate'])
         optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
 
     print('Model: ' + config['model'])
+    print('Using quantized images: ' + str(config['use_quantized']))
 
     criterion = nn.CrossEntropyLoss()
-
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config['lr_factor'], patience=config['lr_patience'], verbose=True)
 
     # Train model
@@ -473,7 +464,8 @@ def train_and_save(config):
     # Prediction on test set
     test_dataset = StabilityDataset(csv_file=config['test_csv'],
                                     img_dir=config['test_img_dir'],
-                                    transform=val_transform)
+                                    transform=val_transform,
+                                    use_quantized=config['use_quantized'])
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
 
     predictions, image_ids = predict(model, test_loader, device)
@@ -492,27 +484,3 @@ def get_optimal_num_workers():
         return 0
     else:
         return multiprocessing.cpu_count()
-
-# Hyperparameters
-config = {
-    'model': 'EfficientAttentionNet',
-    'train_csv': './COMP90086_2024_Project_train/train.csv',
-    'train_img_dir': './COMP90086_2024_Project_train/train',
-    'test_csv': './COMP90086_2024_Project_test/test.csv',
-    'test_img_dir': './COMP90086_2024_Project_test/test',
-    'image_size': 224,
-    'val_ratio': 0.05,
-    'use_augmentation': True,
-    'batch_size': 32,
-    'num_workers': get_optimal_num_workers(),
-    'num_classes': 6,
-    'dropout_rate': 0.3,
-    'learning_rate': 0.001,
-    'lr_factor': 0.1,
-    'lr_patience': 2,
-    'freeze_layers': False,
-    'num_epochs': 30,
-    'early_stopping_patience': 5,
-    'model_save_path': 'efficient_attention_net.pth',
-    'predictions_save_path': 'efficient_attention_predictions.csv'
-}
