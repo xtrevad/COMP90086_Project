@@ -142,7 +142,7 @@ class EfficientAttentionNet(nn.Module):
         return output
 
 
-class EfficientChannelAttentionNet():
+class EfficientChannelAttentionNet(nn.Module):
     def __init__(self, num_classes=6, dropout_rate=0.0):
         super(EfficientChannelAttentionNet, self).__init__()
 
