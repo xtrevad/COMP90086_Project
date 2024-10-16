@@ -142,6 +142,27 @@ class EfficientAttentionNet(nn.Module):
         return output
 
 
+
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttentionModule, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        attention = self.sigmoid(avg_out + max_out)
+        return x * attention
+
+
 class EfficientChannelAttentionNet(nn.Module):
     def __init__(self, num_classes=6, dropout_rate=0.0):
         super(EfficientChannelAttentionNet, self).__init__()
@@ -151,8 +172,9 @@ class EfficientChannelAttentionNet(nn.Module):
         self.efficientnet = models.efficientnet_v2_s(weights=weights)
 
         # Add channel attention modules after specific layers in the EfficientNet backbone
-        self.channel_attention1 = ChannelAttentionModule(in_planes=64)  # Example: After first block
-        self.channel_attention2 = ChannelAttentionModule(in_planes=128)  # Example: After second block
+        # Adjust `in_planes` to match the number of channels at each stage of EfficientNet
+        self.channel_attention1 = ChannelAttentionModule(in_planes=24)  # After first block (features[1])
+        self.channel_attention2 = ChannelAttentionModule(in_planes=48)  # After second block (features[2])
 
         # Get the number of input features to the final classifier layer
         num_ftrs = self.efficientnet.classifier[1].in_features
@@ -166,10 +188,10 @@ class EfficientChannelAttentionNet(nn.Module):
     def forward(self, x):
         # Pass input through the first few layers of EfficientNet
         x = self.efficientnet.features[0](x)  # Initial convolution and stem
-        x = self.efficientnet.features[1](x)  # First block
+        x = self.efficientnet.features[1](x)  # First block (channels: 24)
         x = self.channel_attention1(x)  # Apply channel attention after the first block
         
-        x = self.efficientnet.features[2](x)  # Second block
+        x = self.efficientnet.features[2](x)  # Second block (channels: 48)
         x = self.channel_attention2(x)  # Apply channel attention after the second block
         
         # Continue with the rest of the EfficientNet layers
@@ -226,25 +248,6 @@ class SpatialAttentionModule(nn.Module):
         attention_map = self.sigmoid(self.conv(concat))
         return x * attention_map
 
-
-class ChannelAttentionModule(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttentionModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.fc = nn.Sequential(
-            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
-            nn.ReLU(),
-            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        attention = self.sigmoid(avg_out + max_out)
-        return x * attention
 
 
 def colour_quantisation(image, k=20):
