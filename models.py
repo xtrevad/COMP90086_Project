@@ -344,7 +344,18 @@ def train_and_save(config):
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
 
     # Initialize model, criterion, optimizer, and scheduler
-    model = StabilityPredictor(num_classes=config['num_classes'], dropout_rate=config['dropout_rate'])
+    if config['model'] == 'StabilityPredictor':
+        model = StabilityPredictor(num_classes=config['num_classes'], dropout_rate=config['dropout_rate'])
+    elif config['model'] == 'EfficientAttentionNet':
+        model = EfficientAttentionNet(dropout_rate=config['dropout_rate'])
+    elif config['model'] == 'ConvnextPredictor':
+        model = ConvnextPredictor(num_classes=config['num_classes'], freeze_layers=config['freeze_layers'])
+    else:
+        print('Unrecognised model in config. Defaulting to StabilityPredictor (EfficientNet)')
+        model = StabilityPredictor(num_classes=config['num_classes'], dropout_rate=config['dropout_rate'])
+
+    print(f'Model: {config['model']}')
+
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config['lr_factor'], patience=config['lr_patience'], verbose=True)
@@ -382,6 +393,7 @@ def get_optimal_num_workers():
 
 # Hyperparameters
 config = {
+    'model': 'EfficientAttentionNet',
     'train_csv': './COMP90086_2024_Project_train/train.csv',
     'train_img_dir': './COMP90086_2024_Project_train/train',
     'test_csv': './COMP90086_2024_Project_test/test.csv',
@@ -396,8 +408,9 @@ config = {
     'learning_rate': 0.001,
     'lr_factor': 0.1,
     'lr_patience': 2,
+    'freeze_layers': True,
     'num_epochs': 30,
     'early_stopping_patience': 5,
-    'model_save_path': 'stability_predictor_efficientnetv2.pth',
-    'predictions_save_path': 'predictions.csv'
+    'model_save_path': 'efficient_attention_net.pth',
+    'predictions_save_path': 'efficient_attention_predictions.csv'
 }
