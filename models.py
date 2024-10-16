@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm.notebook import tqdm
 import platform
 import multiprocessing
+import cv2
 
 
 class StabilityDataset(Dataset):
@@ -64,6 +65,13 @@ class StabilityDataset(Dataset):
                 right = left + crop_size
                 bottom = top + crop_size
                 image = image.crop((left, top, right, bottom))
+            if augmentation in [1, 2]:  # Quantise colours
+                open_cv_image = np.array(image)
+                open_cv_image = open_cv_image[:, :, ::-1].copy()  # convert to BGR
+                open_cv_image = colour_quantisation(open_cv_image, k=20)
+                # convert back to PIL image
+                open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(open_cv_image)
 
         # Resize the image to ensure consistent size
         image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
@@ -134,6 +142,48 @@ class EfficientAttentionNet(nn.Module):
         return output
 
 
+class EfficientChannelAttentionNet():
+    def __init__(self, num_classes=6, dropout_rate=0.0):
+        super(EfficientChannelAttentionNet, self).__init__()
+
+        # Default pre-trained weights for EfficientNet V2 Small
+        weights = EfficientNet_V2_S_Weights.DEFAULT
+        self.efficientnet = models.efficientnet_v2_s(weights=weights)
+
+        # Add channel attention modules after specific layers in the EfficientNet backbone
+        self.channel_attention1 = ChannelAttentionModule(in_planes=64)  # Example: After first block
+        self.channel_attention2 = ChannelAttentionModule(in_planes=128)  # Example: After second block
+
+        # Get the number of input features to the final classifier layer
+        num_ftrs = self.efficientnet.classifier[1].in_features
+
+        # Replace the default classifier with a custom one (Dropout + Linear layer)
+        self.efficientnet.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate, inplace=True),
+            nn.Linear(num_ftrs, num_classes)
+        )
+
+    def forward(self, x):
+        # Pass input through the first few layers of EfficientNet
+        x = self.efficientnet.features[0](x)  # Initial convolution and stem
+        x = self.efficientnet.features[1](x)  # First block
+        x = self.channel_attention1(x)  # Apply channel attention after the first block
+        
+        x = self.efficientnet.features[2](x)  # Second block
+        x = self.channel_attention2(x)  # Apply channel attention after the second block
+        
+        # Continue with the rest of the EfficientNet layers
+        for i in range(3, len(self.efficientnet.features)):
+            x = self.efficientnet.features[i](x)
+
+        # Global average pooling and final classifier
+        x = self.efficientnet.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.efficientnet.classifier(x)
+
+        return x
+
+
 
 class ConvnextPredictor(nn.Module):
     def __init__(self, num_classes=6, freeze_layers=True):
@@ -148,6 +198,7 @@ class ConvnextPredictor(nn.Module):
         self.convnextnet.classifier[2] = nn.Linear(num_ftrs, out_features=num_classes, bias=True)
 
         if freeze_layers:
+            print('layers frozen!')
             # Freeze ConvNeXt backbone layers for quicker fine-tuning training
             for param in self.convnextnet.parameters():
                 param.requires_grad = False
@@ -174,6 +225,45 @@ class SpatialAttentionModule(nn.Module):
         concat = torch.cat([avg_out, max_out], dim=1)
         attention_map = self.sigmoid(self.conv(concat))
         return x * attention_map
+
+
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttentionModule, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        attention = self.sigmoid(avg_out + max_out)
+        return x * attention
+
+
+def colour_quantisation(image, k=20):
+    # Convert the image to 2D pixel array
+    pixels = np.float32(image.reshape(-1, 3))
+
+    # Define criteria for K-Means (stop after 10 iter or if accuracy reaches 1.0)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+
+    # Apply K-Means clustering
+    _, labels, palette = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+    # Convert back to 8-bit values
+    quantised = np.uint8(palette)[labels.flatten()]
+
+    # Reshape the image to original dimensions
+    quantised = quantised.reshape(image.shape)
+    
+    return quantised
 
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience, device):
@@ -346,18 +436,27 @@ def train_and_save(config):
     # Initialize model, criterion, optimizer, and scheduler
     if config['model'] == 'StabilityPredictor':
         model = StabilityPredictor(num_classes=config['num_classes'], dropout_rate=config['dropout_rate'])
+        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     elif config['model'] == 'EfficientAttentionNet':
         model = EfficientAttentionNet(dropout_rate=config['dropout_rate'])
+        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    elif config['model'] == 'EfficientChannelAttentionNet':
+        model = EfficientChannelAttentionNet(dropout_rate=config['dropout_rate'])
+        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     elif config['model'] == 'ConvnextPredictor':
         model = ConvnextPredictor(num_classes=config['num_classes'], freeze_layers=config['freeze_layers'])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)  # Smaller LR + L2 regularisation for ConvNeXt
+    
+
     else:
         print('Unrecognised model in config. Defaulting to StabilityPredictor (EfficientNet)')
         model = StabilityPredictor(num_classes=config['num_classes'], dropout_rate=config['dropout_rate'])
+        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
 
-    print(f'Model: {config['model']}')
+    print('Model: ' + config['model'])
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config['lr_factor'], patience=config['lr_patience'], verbose=True)
 
     # Train model
@@ -408,7 +507,7 @@ config = {
     'learning_rate': 0.001,
     'lr_factor': 0.1,
     'lr_patience': 2,
-    'freeze_layers': True,
+    'freeze_layers': False,
     'num_epochs': 30,
     'early_stopping_patience': 5,
     'model_save_path': 'efficient_attention_net.pth',
