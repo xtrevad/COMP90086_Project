@@ -17,7 +17,6 @@ import multiprocessing
 import cv2
 import json
 
-
 class StabilityDataset(Dataset):
     def __init__(self, csv_file, img_dir, transform=None, augment=False, use_quantized=False):
         self.stability_data = pd.read_csv(csv_file)
@@ -68,7 +67,7 @@ class StabilityDataset(Dataset):
             image = torch.from_numpy(image.transpose((2, 0, 1))).float() / 255.0
 
         return image, torch.tensor(stability_class, dtype=torch.long)
-    
+
 class StabilityPredictor(nn.Module):
     def __init__(self, num_classes=6, dropout_rate=0.3):
         super(StabilityPredictor, self).__init__()
@@ -110,6 +109,22 @@ class EfficientAttentionNet(nn.Module):
             nn.Linear(num_ftrs, num_classes)
         )
 
+
+class SpatialAttentionModule(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttentionModule, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Channel-wise max and average pooling (along spatial dimensions)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        concat = torch.cat([avg_out, max_out], dim=1)
+        attention_map = self.sigmoid(self.conv(concat))
+        return x * attention_map
+
+
     def forward(self, x):
         # Pass through the feature extractor (EfficientNet backbone) until the last feature map
         features = self.efficientnet.features(x)  # Extract convolutional features
@@ -127,8 +142,6 @@ class EfficientAttentionNet(nn.Module):
         output = self.efficientnet.classifier(pooled_features)
         
         return output
-
-
 
 class ChannelAttentionModule(nn.Module):
     def __init__(self, in_planes, ratio=16):
@@ -219,22 +232,6 @@ class ConvnextPredictor(nn.Module):
 
     def forward(self, x):
         return self.convnextnet(x)
-    
-
-class SpatialAttentionModule(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttentionModule, self).__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # Channel-wise max and average pooling (along spatial dimensions)
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        concat = torch.cat([avg_out, max_out], dim=1)
-        attention_map = self.sigmoid(self.conv(concat))
-        return x * attention_map
-
 
 
 def colour_quantisation(image, k=20):
@@ -335,17 +332,29 @@ def run_epoch(model, data_loader, criterion, optimizer, device, is_training=True
     return epoch_loss, epoch_acc
 
 def calculate_stats(dataset):
-    loader = DataLoader(dataset, batch_size=100, num_workers=0, shuffle=False)
+    loader = DataLoader(dataset, batch_size=100, num_workers=get_optimal_num_workers(), shuffle=False)
     mean = 0.
     std = 0.
+    total_samples = len(dataset)
+    
+    # Create a tqdm progress bar
+    pbar = tqdm(total=total_samples, desc="Calculating Stats", unit="sample")
+    
     for images, _ in loader:
         batch_samples = images.size(0)
         images = images.view(batch_samples, images.size(1), -1)
         mean += images.mean(2).sum(0)
         std += images.std(2).sum(0)
+        
+        # Update the progress bar
+        pbar.update(batch_samples)
+   
+    mean /= total_samples
+    std /= total_samples
     
-    mean /= len(dataset)
-    std /= len(dataset)
+    # Close the progress bar
+    pbar.close()
+    
     return mean, std
 
 def predict(model, test_loader, device):
@@ -361,14 +370,12 @@ def predict(model, test_loader, device):
             image_ids.extend(ids.numpy())  # Convert tensor to numpy array
     return predictions, image_ids
 
-def save_split_and_stats(train_indices, val_indices, train_mean, train_std, val_mean, val_std, filename):
+def save_split_and_stats(train_indices, val_indices, train_mean, train_std, filename):
     data = {
         'train_indices': train_indices,
         'val_indices': val_indices,
         'train_mean': train_mean.tolist(),
-        'train_std': train_std.tolist(),
-        'val_mean': val_mean.tolist(),
-        'val_std': val_std.tolist()
+        'train_std': train_std.tolist()
     }
     with open(filename, 'w') as f:
         json.dump(data, f)
@@ -380,9 +387,7 @@ def load_split_and_stats(filename):
         data['train_indices'],
         data['val_indices'],
         torch.tensor(data['train_mean']),
-        torch.tensor(data['train_std']),
-        torch.tensor(data['val_mean']),
-        torch.tensor(data['val_std'])
+        torch.tensor(data['train_std'])
     )
 
 def train_and_save(config):
@@ -392,71 +397,60 @@ def train_and_save(config):
     split_stats_file = config.get('split_stats_file', 'split_and_stats.json')
     if config.get('use_existing_split', False) and os.path.exists(split_stats_file):
         print(f"Loading existing split and stats from {split_stats_file}")
-        train_indices, val_indices, train_mean, train_std, val_mean, val_std = load_split_and_stats(split_stats_file)
+        train_indices, val_indices, train_mean, train_std = load_split_and_stats(split_stats_file)
     else:
-        # Create a dataset with only original images for statistics calculation
-        stats_dataset = StabilityDataset(csv_file=config['train_csv'], 
-                                         img_dir=config['train_img_dir'], 
-                                         transform=transforms.ToTensor(),
-                                         augment=False,
-                                         use_quantized=config['use_quantized'])
+        # Create a base dataset without augmentation for splitting and stats calculation
+        base_dataset = StabilityDataset(csv_file=config['train_csv'], 
+                                        img_dir=config['train_img_dir'], 
+                                        transform=transforms.ToTensor(),
+                                        augment=False,
+                                        use_quantized=config['use_quantized'])
 
         # Split dataset into train and validation
-        dataset_size = len(stats_dataset)
+        dataset_size = len(base_dataset)
         indices = list(range(dataset_size))
         np.random.shuffle(indices)
         split = int(np.floor(config['val_ratio'] * dataset_size))
         train_indices, val_indices = indices[split:], indices[:split]
 
-        # Calculate statistics for training and validation sets
-        train_subset = Subset(stats_dataset, train_indices)
-        val_subset = Subset(stats_dataset, val_indices)
+        # Calculate statistics for training set only
+        train_subset = Subset(base_dataset, train_indices)
 
         print("Calculating training dataset statistics...")
         train_mean, train_std = calculate_stats(train_subset)
         print(f"Training dataset mean: {train_mean}")
         print(f"Training dataset std: {train_std}")
 
-        print("Calculating validation dataset statistics...")
-        val_mean, val_std = calculate_stats(val_subset)
-        print(f"Validation dataset mean: {val_mean}")
-        print(f"Validation dataset std: {val_std}")
-
         # Save split and stats
-        save_split_and_stats(train_indices, val_indices, train_mean, train_std, val_mean, val_std, split_stats_file)
+        save_split_and_stats(train_indices, val_indices, train_mean, train_std, split_stats_file)
         print(f"Split and stats saved to {split_stats_file}")
 
     # Create transforms
-    train_transform = transforms.Compose([
+    normalize_transform = transforms.Normalize(mean=train_mean, std=train_std)
+    
+    base_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=train_mean, std=train_std),
+        normalize_transform,
     ])
 
-    val_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=val_mean, std=val_std),
-    ])
+    # Create datasets with appropriate transforms
+    full_dataset = StabilityDataset(csv_file=config['train_csv'], 
+                                    img_dir=config['train_img_dir'], 
+                                    transform=base_transform,
+                                    augment=config['use_augmentation'],
+                                    use_quantized=config['use_quantized'])
 
-    # Create full datasets with augmentation
-    train_dataset = StabilityDataset(csv_file=config['train_csv'], 
-                                     img_dir=config['train_img_dir'], 
-                                     transform=train_transform,
-                                     augment=config['use_augmentation'],
-                                     use_quantized=config['use_quantized'])
-
-    val_dataset = StabilityDataset(csv_file=config['train_csv'], 
-                                   img_dir=config['train_img_dir'], 
-                                   transform=val_transform,
-                                   augment=False,
-                                   use_quantized=config['use_quantized'])
-
-    # Apply the split
-    train_dataset = Subset(train_dataset, [i for i in range(len(train_dataset)) if i % len(val_dataset) in train_indices])
-    val_dataset = Subset(val_dataset, val_indices)
+    # Apply the split, ensuring augmented images stay with their original counterparts
+    if config['use_augmentation']:
+        train_indices = [i for idx in train_indices for i in range(idx * 4, (idx + 1) * 4)]
+        val_indices = [i for idx in val_indices for i in range(idx * 4, (idx + 1) * 4)]
+    
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices[:len(val_indices)//4])  # Only use original images for validation
 
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=get_optimal_num_workers())
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
 
     # Initialize model, criterion, optimizer, and scheduler
     if config['model'] == 'StabilityPredictor':
@@ -493,9 +487,9 @@ def train_and_save(config):
     # Prediction on test set
     test_dataset = StabilityDataset(csv_file=config['test_csv'],
                                     img_dir=config['test_img_dir'],
-                                    transform=val_transform,
+                                    transform=base_transform,
                                     use_quantized=config['use_quantized'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
 
     predictions, image_ids = predict(model, test_loader, device)
 
@@ -512,4 +506,4 @@ def get_optimal_num_workers():
     if platform.system() == 'Windows':
         return 0
     else:
-        return multiprocessing.cpu_count() - 2
+        return multiprocessing.cpu_count()
