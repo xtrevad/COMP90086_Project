@@ -1,9 +1,11 @@
 {
-    "epochs": 1,
+    "epochs": 7,
     "initial_lr": 0.001,
-    "best_val_loss": 1.4154897034168243,
+    "best_val_loss": 1.0999246537685394,
     "lr_schedule": {
-        "0": 0.001
+        "0": 0.0001,
+        "8": 0.00001,
+        "18": 0.00001
     },
     "lr_factor": 0.1,
     "lr_patience": 3,
