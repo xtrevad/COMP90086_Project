@@ -1,0 +1,3 @@
+model,use_quantized,use_augmentation,balance_dataset,additional_columns,target_column,val_loss,val_acc,class_0_acc,class_1_acc,class_2_acc,class_3_acc,class_4_acc,class_5_acc,epochs,initial_lr,best_val_loss,lr_schedule,lr_factor,lr_patience,early_stopping_patience
+EfficientAttentionNet,False,True,False,,stable_height,1.1225549777348836,55.729166666666664,58.173077,70.588234,47.435898,44.166668,48.0,75.0,2,0.001,1.1225549777348836,{'0': 0.001},0.5,2,6
+EfficientAttentionNet,stable_height,,False,False,False,0.1,64,0.3,0.001,0.5,2,False,1,True,6,0.0001,1.3856354157129924,43.229166666666664,63.46154,55.882355,25.641026,43.333332,32.0,0.0,2,0.001,1.3856354157129924,{'0': 0.001}
