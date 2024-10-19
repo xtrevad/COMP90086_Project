@@ -593,7 +593,7 @@ def train_model_split(model, train_loader, val_loader, criterion, optimizer, sch
             best_epoch = epoch
             epochs_no_improve = 0
             
-            torch.save(model, f'state_dicts/{id}.pth')
+            torch.save(model.state_dict(), f'state_dicts/{id}.pth')
         else:
             epochs_no_improve += 1
         
@@ -835,7 +835,7 @@ def get_model_class(model_name):
     }
     return model_classes.get(model_name, StabilityPredictor)
 
-def train_full_dataset(model, config, train_loader, criterion, device, training_params):
+def train_full_dataset(id, model, config, train_loader, criterion, device, training_params):
     num_epochs = training_params['epochs']
     lr_schedule = training_params['lr_schedule']
     
@@ -845,7 +845,9 @@ def train_full_dataset(model, config, train_loader, criterion, device, training_
     initial_lr = lr_schedule[0]  # Assume the first key is 0 for initial learning rate
     optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=config['weight_decay'])
     
-    return train_model_full_dataset(model, train_loader, criterion, optimizer, None, num_epochs, device, lr_schedule)
+    model = train_model_full_dataset(model, train_loader, criterion, optimizer, None, num_epochs, device, lr_schedule)
+    torch.save(model.state_dict(), f'state_dicts/full_{id}.pth')
+    return id, model
 
 def train_with_validation(model, config, train_loader, val_loader, criterion, device):
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
@@ -858,7 +860,7 @@ def train_with_validation(model, config, train_loader, val_loader, criterion, de
     
     save_training_results(id, config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance)
     
-    return model
+    return id, model
 
 def run_predictions(model, config, base_transform, device, use_full_dataset):
     test_dataset = create_test_dataset(config, base_transform)
@@ -899,13 +901,15 @@ def train_and_save(config, use_full_dataset=False, do_predictions=False, model_i
     criterion = nn.CrossEntropyLoss()
     
     if use_full_dataset:
-        model = train_full_dataset(model, config, train_loader, criterion, device, training_params)
+        id, model = train_full_dataset(model_id, model, config, train_loader, criterion, device, training_params)
     else:
-        model = train_with_validation(model, config, train_loader, val_loader, criterion, device)
+        id, model = train_with_validation(model, config, train_loader, val_loader, criterion, device)
 
     if do_predictions:
         base_transform = create_transforms(train_mean, train_std)
         run_predictions(model, config, base_transform, device, use_full_dataset)
+
+    return id
 
 def print_model_info(config, additional_features, num_classes):
     print('Model:', config['model'])
@@ -981,7 +985,7 @@ def record_results(id, config, best_val_loss, best_val_acc, best_val_class_perfo
             'id': id,
             'model': config['model'],
             'target_column': config['target_column'],
-            'additional_columns': ','.join(config['additional_columns']),
+            'additional_columns': json.dumps(config['additional_columns']),  # Use JSON to store list
             'balance_dataset': config['balance_dataset'],
             'use_augmentation': config['use_augmentation'],
             'use_quantized': config['use_quantized'],
@@ -1008,42 +1012,44 @@ def record_results(id, config, best_val_loss, best_val_acc, best_val_class_perfo
         row.update(training_params)
         
         # Convert lr_schedule to string to avoid issues with CSV writing
-        row['lr_schedule'] = json.dumps(row['lr_schedule'])
+        row['lr_schedule'] = json.dumps(row['lr_schedule']).replace('"', '""')
         
         writer.writerow(row)
 
     print(f"Results recorded in {file_path}")
 
 def load_config_from_results(config, results_file, model_id=None):
-    df = pd.read_csv(results_file)
+    csv.register_dialect('custom', delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
     
+    with open(results_file, 'r') as f:
+        reader = csv.DictReader(f, dialect='custom')
+        rows = list(reader)
+
     if model_id:
-        result = df[df['id'] == model_id]
-        if result.empty:
+        result = next((row for row in rows if row['id'] == model_id), None)
+        if result is None:
             raise ValueError(f"No model found with id {model_id}")
-        result = result.iloc[0]
     else:
-        # Get the last row (most recent result) if no id is specified
-        result = df.iloc[-1]
-    
+        result = rows[-1]  # Get the last row
+
     # Update config with values from the results file
     config.update({
         'model': result['model'],
         'target_column': result['target_column'],
-        'additional_columns': result['additional_columns'].split(',') if isinstance(result['additional_columns'], str) else [],
-        'balance_dataset': result['balance_dataset'],
-        'use_augmentation': result['use_augmentation'],
-        'use_quantized': result['use_quantized'],
-        'batch_size': int(result['batch_size']),
+        'additional_columns': json.loads(result['additional_columns']) if result['additional_columns'] else [],
+        'balance_dataset': result['balance_dataset'] == 'True',
+        'use_augmentation': result['use_augmentation'] == 'True',
+        'use_quantized': result['use_quantized'] == 'True',
+        'batch_size': int(float(result['batch_size'])),
         'dropout_rate': float(result['dropout_rate']),
         'weight_decay': float(result['weight_decay']),
     })
     
     # Load training parameters
     training_params = {
-        'epochs': int(result['epochs']),
+        'epochs': int(float(result['epochs'])),
         'initial_lr': float(result['initial_lr']),
-        'lr_schedule': eval(result['lr_schedule'])  # Safely evaluate the string representation of the dictionary
+        'lr_schedule': json.loads(result['lr_schedule'].replace('""', '"'))
     }
     
     return config, training_params
