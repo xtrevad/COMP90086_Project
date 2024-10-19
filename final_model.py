@@ -369,6 +369,80 @@ class ChannelAttentionModule(nn.Module):
         attention = self.sigmoid(avg_out + max_out)
         return x * attention
     
+
+class EfficientSpatialChannelAttentionNet(nn.Module):
+    def __init__(self, num_classes=6, dropout_rate=0.01, additional_features = None):
+        super(EfficientSpatialChannelAttentionNet, self).__init__()
+
+        weights = EfficientNet_V2_S_Weights.DEFAULT
+        self.efficientnet = models.efficientnet_v2_s(weights=weights)
+
+        self.channel_attention1 = ChannelAttentionModule(in_planes=24)  # inputs for efficientnet block 1
+        self.spatial_attention1 = SpatialAttentionModule(kernel_size=7)
+        
+        self.channel_attention2 = ChannelAttentionModule(in_planes=48)  # inputs for efficientnet block 2
+        self.spatial_attention2 = SpatialAttentionModule(kernel_size=7)
+
+        # Get num of inputs for final classifier layer
+        num_ftrs = self.efficientnet.classifier[1].in_features
+
+
+        # Embedding layers for additional features
+        self.additional_features = additional_features or {}
+        self.embedding_layers = nn.ModuleDict()
+        self.embedding_dim = 16
+        total_embedding_dim = 0
+
+        for feature, num_categories in self.additional_features.items():
+            self.embedding_layers[feature] = nn.Embedding(num_categories, self.embedding_dim)
+            total_embedding_dim += self.embedding_dim
+
+        # Combine image features with embeddings
+        self.combined_layer = nn.Linear(num_ftrs + total_embedding_dim, num_ftrs)
+
+        # Replace the default classifier with a custom one (Dropout + Linear layer)
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate, inplace=True),
+            nn.Linear(num_ftrs, num_classes)
+        )
+
+    def forward(self, x, *additional_inputs):
+        # Initial convolution and stem
+        x = self.efficientnet.features[0](x)
+
+        x = self.efficientnet.features[1](x)
+        x = self.channel_attention1(x)
+        x = self.spatial_attention1(x)
+
+        x = self.efficientnet.features[2](x)
+        x = self.channel_attention2(x)
+        x = self.spatial_attention2(x)
+
+        # keep forward passing as normal after attention
+        for i in range(3, len(self.efficientnet.features)):
+            x = self.efficientnet.features[i](x)
+
+        # Global average pooling and final classifier
+        x = self.efficientnet.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Process additional features through embedding layers
+        embeddings = []
+        for i, (feature, _) in enumerate(self.additional_features.items()):
+            embedding = self.embedding_layers[feature](additional_inputs[i])
+            embeddings.append(embedding)
+
+        # Concatenate image features with embeddings
+        if embeddings:
+            x = torch.cat([x] + embeddings, dim=1)
+            x = self.combined_layer(x)
+
+        # Final classification
+        x = self.classifier(x)
+
+        return x
+
+
 class ConvnextPredictor(nn.Module):
     def __init__(self, num_classes=6, freeze_layers=True, additional_features=None):
         super(ConvnextPredictor, self).__init__()
@@ -759,7 +833,8 @@ def get_model_class(model_name):
         'StabilityPredictor': StabilityPredictor,
         'EfficientAttentionNet': EfficientAttentionNet,
         'EfficientChannelAttentionNet': EfficientChannelAttentionNet,
-        'ConvnextPredictor': ConvnextPredictor
+        'ConvnextPredictor': ConvnextPredictor,
+        'EfficientSpatialChannelAttentionNet': EfficientSpatialChannelAttentionNet
     }
     return model_classes.get(model_name, StabilityPredictor)
 

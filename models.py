@@ -207,8 +207,9 @@ class EfficientChannelAttentionNet(nn.Module):
 
 
 class EfficientSpatialChannelAttentionNet(nn.Module):
-    def __init__(self, num_classes=6, dropout_rate=0.01):
+    def __init__(self, num_classes=6, dropout_rate=0.01, additional_features = None):
         super(EfficientSpatialChannelAttentionNet, self).__init__()
+
         weights = EfficientNet_V2_S_Weights.DEFAULT
         self.efficientnet = models.efficientnet_v2_s(weights=weights)
 
@@ -221,13 +222,27 @@ class EfficientSpatialChannelAttentionNet(nn.Module):
         # Get num of inputs for final classifier layer
         num_ftrs = self.efficientnet.classifier[1].in_features
 
+
+        # Embedding layers for additional features
+        self.additional_features = additional_features or {}
+        self.embedding_layers = nn.ModuleDict()
+        self.embedding_dim = 16
+        total_embedding_dim = 0
+
+        for feature, num_categories in self.additional_features.items():
+            self.embedding_layers[feature] = nn.Embedding(num_categories, self.embedding_dim)
+            total_embedding_dim += self.embedding_dim
+
+        # Combine image features with embeddings
+        self.combined_layer = nn.Linear(num_ftrs + total_embedding_dim, num_ftrs)
+
         # Replace the default classifier with a custom one (Dropout + Linear layer)
-        self.efficientnet.classifier = nn.Sequential(
+        self.classifier = nn.Sequential(
             nn.Dropout(p=dropout_rate, inplace=True),
             nn.Linear(num_ftrs, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x, *additional_inputs):
         # Initial convolution and stem
         x = self.efficientnet.features[0](x)
 
@@ -246,7 +261,20 @@ class EfficientSpatialChannelAttentionNet(nn.Module):
         # Global average pooling and final classifier
         x = self.efficientnet.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.efficientnet.classifier(x)
+
+        # Process additional features through embedding layers
+        embeddings = []
+        for i, (feature, _) in enumerate(self.additional_features.items()):
+            embedding = self.embedding_layers[feature](additional_inputs[i])
+            embeddings.append(embedding)
+
+        # Concatenate image features with embeddings
+        if embeddings:
+            x = torch.cat([x] + embeddings, dim=1)
+            x = self.combined_layer(x)
+
+        # Final classification
+        x = self.classifier(x)
 
         return x
 
@@ -559,6 +587,11 @@ def get_optimal_num_workers():
 
 
 class MajorityVoteEnsemble(nn.Module):
+    '''
+    This model is to be used for making predictions only. It cannot be 'trained'; it takes existing
+    models with loaded state dicts as inputs and simply returns the majority vote of their predictions
+    given an input.
+    '''
     def __init__(self, models):
         super(MajorityVoteEnsemble, self).__init__()
         self.models = models
