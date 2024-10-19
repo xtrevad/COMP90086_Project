@@ -479,28 +479,24 @@ def train_model_full_dataset(model, train_loader, criterion, optimizer, schedule
 
     return model
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience, device):
+def train_model_split(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience, device):
     model.to(device)
-    
-    best_val_loss = float('inf')
     epochs_no_improve = 0
-    best_model = None
-    epoch_count = 0
+    best_epoch = None
     lr_schedule = {0: optimizer.param_groups[0]['lr']}  # Initial learning rate
     
-    final_val_loss = None
-    final_val_acc = None
-    final_val_class_performance = None
+    best_val_loss = float('inf')
+    best_val_acc = 0
+    best_val_class_performance = None
     
     for epoch in range(num_epochs):
-        epoch_count += 1
         print(f'Epoch {epoch+1}/{num_epochs}')
         
         # Training phase
         model.train()
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device, is_training=True)
         
-         # Validation phase
+        # Validation phase
         model.eval()
         val_loss, val_acc, val_class_performance = run_epoch(model, val_loader, criterion, optimizer, device, is_training=False, return_class_performance=True)
         
@@ -515,23 +511,26 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-        print(f'Learning Rate: {new_lr:.6f}')
+        print(f'Learning Rate: {scheduler.optimizer.param_groups[0]["lr"]:.6f}')
         print('-' * 60)
 
         # Early stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_val_acc = val_acc
+            best_val_class_performance = val_class_performance
+            best_epoch = epoch
             epochs_no_improve = 0
+            # Here you might want to save the best model
+            # torch.save(model.state_dict(), 'best_model.pth')
         else:
             epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping triggered after {epoch + 1} epochs')
+            break
 
-        # Update final validation performance
-        final_val_loss = val_loss
-        final_val_acc = val_acc
-        final_val_class_performance = val_class_performance
-
-    return model, epoch_count, best_val_loss, lr_schedule, final_val_loss, final_val_acc, final_val_class_performance
-
+    return model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance
 
 def run_epoch(model, data_loader, criterion, optimizer, device, is_training=True, return_class_performance=False):
     running_loss = 0.0
@@ -669,175 +668,206 @@ def get_optimal_num_workers():
     else:
         return multiprocessing.cpu_count()
 
-def train_and_save(config, use_full_dataset=False, run_predictions=False):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    # Check if we should load existing split and stats
+def load_or_create_split_and_stats(config, use_full_dataset):
     full_data_suffix = "_full" if use_full_dataset else ""
     split_stats_file = f"{config['output_folder']}/split_and_stats{full_data_suffix}.json"
+    
     if config['use_existing_split'] and os.path.exists(split_stats_file):
         print(f"Loading existing split and stats from {split_stats_file}")
-        train_indices, val_indices, train_mean, train_std = load_split_and_stats(split_stats_file)
+        return load_split_and_stats(split_stats_file)
     else:
-        # Create a base dataset without augmentation for splitting and stats calculation
-        base_dataset = StabilityDataset(csv_file=config['train_csv'], 
-                                        img_dir=config['train_img_dir'], 
-                                        transform=transforms.ToTensor(),
-                                        augment=False,
-                                        use_quantized=config['use_quantized'],
-                                        target_column=config['target_column'],
-                                        additional_columns=config['additional_columns'],
-                                        balance_dataset=config['balance_dataset'])
+        return create_new_split_and_stats(config, use_full_dataset, split_stats_file)
 
-        # Calculate statistics for the entire dataset
-        print("Calculating dataset statistics...")
-        train_mean, train_std = calculate_stats(base_dataset)
-        print(f"Dataset mean: {train_mean}")
-        print(f"Dataset std: {train_std}")
+def create_new_split_and_stats(config, use_full_dataset, split_stats_file):
+    base_dataset = create_base_dataset(config)
+    train_mean, train_std = calculate_stats(base_dataset)
+    print(f"Dataset mean: {train_mean}")
+    print(f"Dataset std: {train_std}")
 
-        if use_full_dataset:
-            train_indices = list(range(len(base_dataset)))
-            val_indices = []
-        else:
-            # Split dataset into train and validation
-            dataset_size = len(base_dataset)
-            indices = list(range(dataset_size))
-            np.random.shuffle(indices)
-            split = int(np.floor(config['val_ratio'] * dataset_size))
-            train_indices, val_indices = indices[split:], indices[:split]
+    if use_full_dataset:
+        train_indices = list(range(len(base_dataset)))
+        val_indices = []
+    else:
+        train_indices, val_indices = split_dataset(base_dataset, config['val_ratio'])
 
-        # Save split and stats
-        save_split_and_stats(train_indices, val_indices, train_mean, train_std, split_stats_file)
-        print(f"Split and stats saved to {split_stats_file}")
+    save_split_and_stats(train_indices, val_indices, train_mean, train_std, split_stats_file)
+    print(f"Split and stats saved to {split_stats_file}")
+    return train_indices, val_indices, train_mean, train_std
 
-    # Create transforms
-    normalize_transform = transforms.Normalize(mean=train_mean, std=train_std)
+def create_base_dataset(config):
+    return StabilityDataset(
+        csv_file=config['train_csv'], 
+        img_dir=config['train_img_dir'], 
+        transform=transforms.ToTensor(),
+        augment=False,
+        use_quantized=config['use_quantized'],
+        target_column=config['target_column'],
+        additional_columns=config['additional_columns'],
+        balance_dataset=config['balance_dataset']
+    )
+
+def split_dataset(dataset, val_ratio):
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+    np.random.shuffle(indices)
+    split = int(np.floor(val_ratio * dataset_size))
+    return indices[split:], indices[:split]
+
+def create_datasets_and_loaders(config, train_indices, val_indices, train_mean, train_std, use_full_dataset):
+    base_transform = create_transforms(train_mean, train_std)
+    full_dataset = create_full_dataset(config, base_transform)
     
-    base_transform = transforms.Compose([
-        transforms.ToTensor(),
-        normalize_transform,
-    ])
+    train_dataset, val_dataset = create_train_val_datasets(full_dataset, train_indices, val_indices, config['use_augmentation'], use_full_dataset)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=get_optimal_num_workers())
+    val_loader = None if use_full_dataset else DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
+    
+    return full_dataset, train_loader, val_loader
 
-    # Create datasets with appropriate transforms
-    full_dataset = StabilityDataset(csv_file=config['train_csv'], 
-                                    img_dir=config['train_img_dir'], 
-                                    transform=base_transform,
-                                    augment=config['use_augmentation'],
-                                    use_quantized=config['use_quantized'],
-                                    additional_columns=config['additional_columns'],
-                                    target_column=config['target_column'],
-                                    balance_dataset=config['balance_dataset'])
+def create_transforms(train_mean, train_std):
+    normalize_transform = transforms.Normalize(mean=train_mean, std=train_std)
+    return transforms.Compose([transforms.ToTensor(), normalize_transform])
 
-    # Get the number of categories for each additional feature
-    additional_features = full_dataset.get_feature_dimensions()
-    num_classes = full_dataset.get_target_dimension()
+def create_full_dataset(config, base_transform):
+    return StabilityDataset(
+        csv_file=config['train_csv'], 
+        img_dir=config['train_img_dir'], 
+        transform=base_transform,
+        augment=config['use_augmentation'],
+        use_quantized=config['use_quantized'],
+        additional_columns=config['additional_columns'],
+        target_column=config['target_column'],
+        balance_dataset=config['balance_dataset']
+    )
 
-    # Apply the split, ensuring augmented images stay with their original counterparts
-    if config['use_augmentation']:
+def create_train_val_datasets(full_dataset, train_indices, val_indices, use_augmentation, use_full_dataset):
+    if use_augmentation:
         train_indices = [i for idx in train_indices for i in range(idx * 4, (idx + 1) * 4)]
         val_indices = [i for idx in val_indices for i in range(idx * 4, (idx + 1) * 4)]
     
     train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = None if use_full_dataset else Subset(full_dataset, val_indices[:len(val_indices)//4])
     
-    if not use_full_dataset:
-        val_dataset = Subset(full_dataset, val_indices[:len(val_indices)//4])  # Only use original images for validation
-        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
+    return train_dataset, val_dataset
 
-    # Create data loader
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=get_optimal_num_workers())
+def initialize_model(config, num_classes, additional_features):
+    model_class = get_model_class(config['model'])
+    return model_class(num_classes=num_classes, dropout_rate=config['dropout_rate'], additional_features=additional_features)
 
-    # Initialize model, criterion, optimizer, and scheduler
-    if config['model'] == 'StabilityPredictor':
-        model = StabilityPredictor(num_classes=num_classes, dropout_rate=config['dropout_rate'], additional_features=additional_features)
-    elif config['model'] == 'EfficientAttentionNet':
-        model = EfficientAttentionNet(num_classes=num_classes, dropout_rate=config['dropout_rate'], additional_features=additional_features)
-    elif config['model'] == 'EfficientChannelAttentionNet':
-        model = EfficientChannelAttentionNet(num_classes=num_classes, dropout_rate=config['dropout_rate'], additional_features=additional_features)
-    elif config['model'] == 'ConvnextPredictor':
-        model = ConvnextPredictor(num_classes=num_classes, freeze_layers=config['freeze_layers'], additional_features=additional_features)
-    else:
-        print('Unrecognised model in config. Defaulting to StabilityPredictor (EfficientNet)')
-        model = StabilityPredictor(num_classes=num_classes, dropout_rate=config['dropout_rate'], additional_features=additional_features)
+def get_model_class(model_name):
+    model_classes = {
+        'StabilityPredictor': StabilityPredictor,
+        'EfficientAttentionNet': EfficientAttentionNet,
+        'EfficientChannelAttentionNet': EfficientChannelAttentionNet,
+        'ConvnextPredictor': ConvnextPredictor
+    }
+    return model_classes.get(model_name, StabilityPredictor)
 
-    print('Model: ' + config['model'])
-    print('Using quantized images: ' + str(config['use_quantized']))
-    print('Additional features:', ', '.join(f"{k}: {v} categories" for k, v in additional_features.items()))
-    print(f'Target feature: {config["target_column"]} ({num_classes} categories)')
+def train_full_dataset(model, config, train_loader, criterion, device):
+    training_params = load_training_params(config.get('training_params_file', f"{config['output_folder']}/training_params.json"))
+    num_epochs = training_params['epochs']
+    lr_schedule = training_params['lr_schedule']
+    
+    initial_lr = list(lr_schedule.values())[0]
+    optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=config['weight_decay'])
+    
+    return train_model_full_dataset(model, train_loader, criterion, optimizer, None, num_epochs, device, lr_schedule)
+
+def train_with_validation(model, config, train_loader, val_loader, criterion, device):
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config['lr_factor'], patience=config['lr_patience'])
+    
+    model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance = train_model_split(
+        model, train_loader, val_loader, criterion, optimizer, scheduler, 
+        num_epochs=config['num_epochs'], patience=config['early_stopping_patience'], device=device
+    )
+    
+    save_training_results(config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance)
+    
+    return model
+
+def run_predictions(model, config, base_transform, device, use_full_dataset):
+    test_dataset = create_test_dataset(config, base_transform)
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
+    
+    predictions, image_ids = predict(model, test_loader, device)
+    save_predictions_to_csv(config, image_ids, predictions, use_full_dataset, test_dataset)
+
+def create_test_dataset(config, base_transform):
+    return StabilityDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=base_transform,
+        augment=False,
+        use_quantized=config['use_quantized'],
+        additional_columns=config['additional_columns'],
+        target_column=config['target_column'],
+        reference_csv=config['train_csv']
+    )
+
+def train_and_save(config, use_full_dataset=False, do_predictions=False):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    train_indices, val_indices, train_mean, train_std = load_or_create_split_and_stats(config, use_full_dataset)
+    full_dataset, train_loader, val_loader = create_datasets_and_loaders(config, train_indices, val_indices, train_mean, train_std, use_full_dataset)
+
+    additional_features = full_dataset.get_feature_dimensions()
+    num_classes = full_dataset.get_target_dimension()
+
+    model = initialize_model(config, num_classes, additional_features)
+    print_model_info(config, additional_features, num_classes)
 
     criterion = nn.CrossEntropyLoss()
-
+    
     if use_full_dataset:
-        # Load training parameters from JSON file
-        training_params_file = config.get('training_params_file', f"{config['output_folder']}/training_params.json")
-        training_params = load_training_params(training_params_file)
-        num_epochs = training_params['epochs']
-        lr_schedule = training_params['lr_schedule']
-        print(f"Loaded training parameters from {training_params_file}")
-        print(f"Epochs: {num_epochs}")
-        print(f"Learning rate schedule: {lr_schedule}")
-
-        # Use the loaded learning rate schedule
-        initial_lr = list(lr_schedule.values())[0]
-        optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=config['weight_decay'])
-
-        # We don't need a scheduler anymore, as we're manually setting the learning rate in train_model_full_dataset
-        scheduler = None
-        
-        # Train model without validation
-        print('Training on full dataset...')
-        model = train_model_full_dataset(model, train_loader, criterion, optimizer, scheduler, num_epochs, device, lr_schedule)
+        model = train_full_dataset(model, config, train_loader, criterion, device)
     else:
-        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config['lr_factor'], patience=config['lr_patience'], verbose=True)
-        
-        # Train model with validation
-        print('Training with validation...')
-        model, best_epoch, best_val_loss, lr_schedule, final_val_loss, final_val_acc, final_val_class_performance = train_model(
-            model, train_loader, val_loader, criterion, optimizer, scheduler, 
-            num_epochs=config['num_epochs'], patience=config['early_stopping_patience'], device=device
-        )
+        model = train_with_validation(model, config, train_loader, val_loader, criterion, device)
 
-         # Save training parameters
-        training_params = {
-            "epochs": best_epoch + 1,
-            "initial_lr": config['learning_rate'],
-            "best_val_loss": best_val_loss,
-            "lr_schedule": {str(k): v for k, v in lr_schedule.items()},
-        }
-        training_params_file = config['training_params_file']
-        save_training_params(training_params_file, training_params)
+    if do_predictions:
+        base_transform = create_transforms(train_mean, train_std)
+        run_predictions(model, config, base_transform, device, use_full_dataset)
 
-        # Record results
-        record_results(config, final_val_loss, final_val_acc, final_val_class_performance, training_params, f"{config['output_folder']}/model_results.csv")
+def print_model_info(config, additional_features, num_classes):
+    print('Model:', config['model'])
+    if len(additional_features) > 0:
+        print('Additional features:', ', '.join(f"{k}: {v} categories" for k, v in additional_features.items()))
+    print(f'Target feature: {config["target_column"]} ({num_classes} categories)')
 
-    # Prediction on test set (if run_predictions is True)
-    if run_predictions:
-        test_dataset = StabilityDataset(csv_file=config['test_csv'],
-                                        img_dir=config['test_img_dir'],
-                                        transform=base_transform,
-                                        augment=False,
-                                        use_quantized=config['use_quantized'],
-                                        additional_columns=config['additional_columns'],
-                                        target_column=config['target_column'],
-                                        reference_csv=config['train_csv'])  # Use train_csv as reference for label mapping
-        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
-
-        predictions, image_ids = predict(model, test_loader, device)
-
-        # Save predictions to CSV
-        model_type = "full" if use_full_dataset else "val"
-        predictions_save_path = f"{config['output_folder']}/{model_type}_predictions.csv"
-        with open(predictions_save_path, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['id', config['target_column']])
-            for img_id, pred in zip(image_ids, predictions):
-                original_label = test_dataset.get_original_label(pred)
-                writer.writerow([int(img_id), int(original_label)])
-        print(f"Predictions saved to {predictions_save_path}")
-
-        # Check label consistency
-        check_label_consistency(config['train_csv'], predictions_save_path, config['target_column'])
-
+def save_predictions_to_csv(config, image_ids, predictions, use_full_dataset, test_dataset):
+    model_type = "full" if use_full_dataset else "val"
+    predictions_save_path = f"{config['output_folder']}/{model_type}_predictions.csv"
+    
+    # Check if file exists and if target column is present
+    file_exists = os.path.isfile(predictions_save_path)
+    target_column_exists = False
+    
+    if file_exists:
+        df = pd.read_csv(predictions_save_path)
+        target_column_exists = config['target_column'] in df.columns
+    
+    # Prepare new data
+    new_data = pd.DataFrame({
+        'id': image_ids,
+        config['target_column']: [int(test_dataset.get_original_label(pred)) for pred in predictions]
+    })
+    
+    if file_exists and target_column_exists:
+        # Update existing file
+        df = pd.read_csv(predictions_save_path)
+        df = df.set_index('id')
+        df.update(new_data.set_index('id'))
+        df.to_csv(predictions_save_path)
+    else:
+        # Create new file or append column
+        if file_exists:
+            df = pd.read_csv(predictions_save_path)
+            df = df.merge(new_data, on='id', how='left')
+        else:
+            df = new_data
+        df.to_csv(predictions_save_path, index=False)
+    
+    print(f"Predictions saved to {predictions_save_path}")
 
 def save_training_params(file_path, params):
     with open(file_path, 'w') as f:
@@ -854,13 +884,23 @@ def load_training_params(file_path):
     
     return params
 
-def record_results(config, final_val_loss, final_val_acc, final_val_class_performance, training_params, file_path):
+def save_training_results(config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance):
+    training_params = {
+        "epochs": best_epoch + 1,
+        "initial_lr": config['learning_rate'],
+        "best_val_loss": best_val_loss,
+        "lr_schedule": {str(k): v for k, v in lr_schedule.items()},
+    }
+    save_training_params(config['training_params_file'], training_params)
+    record_results(config, best_val_loss, best_val_acc, best_val_class_performance, training_params, f"{config['output_folder']}/model_results.csv")
+
+def record_results(config, best_val_loss, best_val_acc, best_val_class_performance, training_params, file_path):
     fieldnames = [
         'model', 'target_column', 'additional_columns', 'balance_dataset', 'use_augmentation', 
         'use_quantized', 'val_ratio', 'batch_size', 'dropout_rate', 'learning_rate', 'lr_factor', 
         'lr_patience', 'freeze_layers', 'num_epochs', 'use_existing_split', 'early_stopping_patience', 
         'weight_decay', 'val_loss', 'val_acc'
-    ] + [f'class_{i}_acc' for i in range(len(final_val_class_performance))] + \
+    ] + [f'class_{i}_acc' for i in range(len(best_val_class_performance))] + \
     ['epochs', 'initial_lr', 'best_val_loss', 'lr_schedule']
 
     file_exists = os.path.isfile(file_path)
@@ -889,16 +929,19 @@ def record_results(config, final_val_loss, final_val_acc, final_val_class_perfor
             'use_existing_split': config['use_existing_split'],
             'early_stopping_patience': config['early_stopping_patience'],
             'weight_decay': config['weight_decay'],
-            'val_loss': final_val_loss,
-            'val_acc': final_val_acc,
+            'val_loss': best_val_loss,
+            'val_acc': best_val_acc,
         }
         
         # Add per-class accuracy
-        for i, acc in enumerate(final_val_class_performance):
+        for i, acc in enumerate(best_val_class_performance):
             row[f'class_{i}_acc'] = acc
         
         # Add training parameters
         row.update(training_params)
+        
+        # Convert lr_schedule to string to avoid issues with CSV writing
+        row['lr_schedule'] = json.dumps(row['lr_schedule'])
         
         writer.writerow(row)
 
