@@ -786,16 +786,6 @@ def train_with_validation(model, config, train_loader, val_loader, criterion, de
     
     return model
 
-def save_training_results(config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance):
-    training_params = {
-        "epochs": best_epoch + 1,
-        "initial_lr": config['learning_rate'],
-        "best_val_loss": best_val_loss,
-        "lr_schedule": {str(k): v for k, v in lr_schedule.items()},
-    }
-    save_training_params(config['training_params_file'], training_params)
-    record_results(config, best_val_acc, best_val_class_performance, training_params, f"{config['output_folder']}/model_results.csv")
-
 def run_predictions(model, config, base_transform, device, use_full_dataset):
     test_dataset = create_test_dataset(config, base_transform)
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=get_optimal_num_workers())
@@ -815,7 +805,7 @@ def create_test_dataset(config, base_transform):
         reference_csv=config['train_csv']
     )
 
-def train_and_save(config, use_full_dataset=False, run_predictions=False):
+def train_and_save(config, use_full_dataset=False, do_predictions=False):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     train_indices, val_indices, train_mean, train_std = load_or_create_split_and_stats(config, use_full_dataset)
@@ -834,7 +824,7 @@ def train_and_save(config, use_full_dataset=False, run_predictions=False):
     else:
         model = train_with_validation(model, config, train_loader, val_loader, criterion, device)
 
-    if run_predictions:
+    if do_predictions:
         base_transform = create_transforms(train_mean, train_std)
         run_predictions(model, config, base_transform, device, use_full_dataset)
 
@@ -894,6 +884,16 @@ def load_training_params(file_path):
     
     return params
 
+def save_training_results(config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance):
+    training_params = {
+        "epochs": best_epoch + 1,
+        "initial_lr": config['learning_rate'],
+        "best_val_loss": best_val_loss,
+        "lr_schedule": {str(k): v for k, v in lr_schedule.items()},
+    }
+    save_training_params(config['training_params_file'], training_params)
+    record_results(config, best_val_loss, best_val_acc, best_val_class_performance, training_params, f"{config['output_folder']}/model_results.csv")
+
 def record_results(config, best_val_loss, best_val_acc, best_val_class_performance, training_params, file_path):
     fieldnames = [
         'model', 'target_column', 'additional_columns', 'balance_dataset', 'use_augmentation', 
@@ -901,7 +901,7 @@ def record_results(config, best_val_loss, best_val_acc, best_val_class_performan
         'lr_patience', 'freeze_layers', 'num_epochs', 'use_existing_split', 'early_stopping_patience', 
         'weight_decay', 'val_loss', 'val_acc'
     ] + [f'class_{i}_acc' for i in range(len(best_val_class_performance))] + \
-    ['epochs', 'initial_lr', 'lr_schedule']
+    ['epochs', 'initial_lr', 'best_val_loss', 'lr_schedule']
 
     file_exists = os.path.isfile(file_path)
     
@@ -939,6 +939,9 @@ def record_results(config, best_val_loss, best_val_acc, best_val_class_performan
         
         # Add training parameters
         row.update(training_params)
+        
+        # Convert lr_schedule to string to avoid issues with CSV writing
+        row['lr_schedule'] = json.dumps(row['lr_schedule'])
         
         writer.writerow(row)
 
