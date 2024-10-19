@@ -16,6 +16,7 @@ import platform
 import multiprocessing
 import cv2
 import json
+import uuid
 
 class StabilityDataset(Dataset):
     def __init__(self, csv_file, img_dir, transform=None, augment=False, use_quantized=False, additional_columns=None, target_column=None, balance_dataset=False, reference_csv=None):
@@ -47,14 +48,8 @@ class StabilityDataset(Dataset):
 
         if balance_dataset and self.target_column is not None:
             self._balance_dataset()
-        
-        if balance_dataset and self.target_column is not None:
-            self._balance_dataset()
 
     def _balance_dataset(self):
-        if self.target_column is None:
-            return
-
         # Count occurrences of each class
         class_counts = self.stability_data[self.target_column].value_counts()
         min_class_count = class_counts.min()
@@ -466,21 +461,23 @@ def train_model_full_dataset(model, train_loader, criterion, optimizer, schedule
         print(f'Epoch {epoch+1}/{num_epochs}')
         
         # Set the learning rate for this epoch
+        current_lr = get_lr(epoch)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = get_lr(epoch)
+            param_group['lr'] = current_lr
         
         # Training phase
         model.train()
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device, is_training=True)
         
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+        print(f'Learning Rate: {current_lr:.6f}')
         print('-' * 60)
 
     return model
 
 def train_model_split(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience, device):
     model.to(device)
+    id = generate_model_id()
     epochs_no_improve = 0
     best_epoch = None
     lr_schedule = {0: optimizer.param_groups[0]['lr']}  # Initial learning rate
@@ -521,8 +518,8 @@ def train_model_split(model, train_loader, val_loader, criterion, optimizer, sch
             best_val_class_performance = val_class_performance
             best_epoch = epoch
             epochs_no_improve = 0
-            # Here you might want to save the best model
-            # torch.save(model.state_dict(), 'best_model.pth')
+            
+            torch.save(model, f'state_dicts/{id}.pth')
         else:
             epochs_no_improve += 1
         
@@ -530,7 +527,7 @@ def train_model_split(model, train_loader, val_loader, criterion, optimizer, sch
             print(f'Early stopping triggered after {epoch + 1} epochs')
             break
 
-    return model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance
+    return id, model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance
 
 def run_epoch(model, data_loader, criterion, optimizer, device, is_training=True, return_class_performance=False):
     running_loss = 0.0
@@ -763,12 +760,14 @@ def get_model_class(model_name):
     }
     return model_classes.get(model_name, StabilityPredictor)
 
-def train_full_dataset(model, config, train_loader, criterion, device):
-    training_params = load_training_params(config.get('training_params_file', f"{config['output_folder']}/training_params.json"))
+def train_full_dataset(model, config, train_loader, criterion, device, training_params):
     num_epochs = training_params['epochs']
     lr_schedule = training_params['lr_schedule']
     
-    initial_lr = list(lr_schedule.values())[0]
+    # Ensure lr_schedule keys are integers
+    lr_schedule = {int(k): float(v) for k, v in lr_schedule.items()}
+    
+    initial_lr = lr_schedule[0]  # Assume the first key is 0 for initial learning rate
     optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=config['weight_decay'])
     
     return train_model_full_dataset(model, train_loader, criterion, optimizer, None, num_epochs, device, lr_schedule)
@@ -777,12 +776,12 @@ def train_with_validation(model, config, train_loader, val_loader, criterion, de
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config['lr_factor'], patience=config['lr_patience'])
     
-    model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance = train_model_split(
+    id, model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance = train_model_split(
         model, train_loader, val_loader, criterion, optimizer, scheduler, 
         num_epochs=config['num_epochs'], patience=config['early_stopping_patience'], device=device
     )
     
-    save_training_results(config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance)
+    save_training_results(id, config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance)
     
     return model
 
@@ -805,7 +804,7 @@ def create_test_dataset(config, base_transform):
         reference_csv=config['train_csv']
     )
 
-def train_and_save(config, use_full_dataset=False, do_predictions=False):
+def train_and_save(config, use_full_dataset=False, do_predictions=False, model_id=None):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     train_indices, val_indices, train_mean, train_std = load_or_create_split_and_stats(config, use_full_dataset)
@@ -814,13 +813,18 @@ def train_and_save(config, use_full_dataset=False, do_predictions=False):
     additional_features = full_dataset.get_feature_dimensions()
     num_classes = full_dataset.get_target_dimension()
 
+    if use_full_dataset:
+        # Load config and training params from model_results.csv
+        results_file = f"{config['output_folder']}/model_results.csv"
+        config, training_params = load_config_from_results(config, results_file, model_id)
+
     model = initialize_model(config, num_classes, additional_features)
     print_model_info(config, additional_features, num_classes)
 
     criterion = nn.CrossEntropyLoss()
     
     if use_full_dataset:
-        model = train_full_dataset(model, config, train_loader, criterion, device)
+        model = train_full_dataset(model, config, train_loader, criterion, device, training_params)
     else:
         model = train_with_validation(model, config, train_loader, val_loader, criterion, device)
 
@@ -869,34 +873,21 @@ def save_predictions_to_csv(config, image_ids, predictions, use_full_dataset, te
     
     print(f"Predictions saved to {predictions_save_path}")
 
-def save_training_params(file_path, params):
-    with open(file_path, 'w') as f:
-        json.dump(params, f, indent=4)
-    print(f"Training parameters saved to {file_path}")
-
-def load_training_params(file_path):
-    with open(file_path, 'r') as f:
-        params = json.load(f)
-    
-    # Convert epoch numbers to integers in lr_schedule
-    if 'lr_schedule' in params:
-        params['lr_schedule'] = {int(k): v for k, v in params['lr_schedule'].items()}
-    
-    return params
-
-def save_training_results(config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance):
+def save_training_results(id, config, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance):
     training_params = {
         "epochs": best_epoch + 1,
         "initial_lr": config['learning_rate'],
         "best_val_loss": best_val_loss,
         "lr_schedule": {str(k): v for k, v in lr_schedule.items()},
     }
-    save_training_params(config['training_params_file'], training_params)
-    record_results(config, best_val_loss, best_val_acc, best_val_class_performance, training_params, f"{config['output_folder']}/model_results.csv")
+    record_results(id, config, best_val_loss, best_val_acc, best_val_class_performance, training_params, f"{config['output_folder']}/model_results.csv")
 
-def record_results(config, best_val_loss, best_val_acc, best_val_class_performance, training_params, file_path):
+def generate_model_id():
+    return str(uuid.uuid4())
+
+def record_results(id, config, best_val_loss, best_val_acc, best_val_class_performance, training_params, file_path):
     fieldnames = [
-        'model', 'target_column', 'additional_columns', 'balance_dataset', 'use_augmentation', 
+        'id', 'model', 'target_column', 'additional_columns', 'balance_dataset', 'use_augmentation', 
         'use_quantized', 'val_ratio', 'batch_size', 'dropout_rate', 'learning_rate', 'lr_factor', 
         'lr_patience', 'freeze_layers', 'num_epochs', 'use_existing_split', 'early_stopping_patience', 
         'weight_decay', 'val_loss', 'val_acc'
@@ -912,6 +903,7 @@ def record_results(config, best_val_loss, best_val_acc, best_val_class_performan
             writer.writeheader()
         
         row = {
+            'id': id,
             'model': config['model'],
             'target_column': config['target_column'],
             'additional_columns': ','.join(config['additional_columns']),
@@ -946,3 +938,37 @@ def record_results(config, best_val_loss, best_val_acc, best_val_class_performan
         writer.writerow(row)
 
     print(f"Results recorded in {file_path}")
+
+def load_config_from_results(config, results_file, model_id=None):
+    df = pd.read_csv(results_file)
+    
+    if model_id:
+        result = df[df['id'] == model_id]
+        if result.empty:
+            raise ValueError(f"No model found with id {model_id}")
+        result = result.iloc[0]
+    else:
+        # Get the last row (most recent result) if no id is specified
+        result = df.iloc[-1]
+    
+    # Update config with values from the results file
+    config.update({
+        'model': result['model'],
+        'target_column': result['target_column'],
+        'additional_columns': result['additional_columns'].split(',') if isinstance(result['additional_columns'], str) else [],
+        'balance_dataset': result['balance_dataset'],
+        'use_augmentation': result['use_augmentation'],
+        'use_quantized': result['use_quantized'],
+        'batch_size': int(result['batch_size']),
+        'dropout_rate': float(result['dropout_rate']),
+        'weight_decay': float(result['weight_decay']),
+    })
+    
+    # Load training parameters
+    training_params = {
+        'epochs': int(result['epochs']),
+        'initial_lr': float(result['initial_lr']),
+        'lr_schedule': eval(result['lr_schedule'])  # Safely evaluate the string representation of the dictionary
+    }
+    
+    return config, training_params
