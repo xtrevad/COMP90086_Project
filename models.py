@@ -206,6 +206,51 @@ class EfficientChannelAttentionNet(nn.Module):
         return x
 
 
+class EfficientSpatialChannelAttentionNet(nn.Module):
+    def __init__(self, num_classes=6, dropout_rate=0.01):
+        super(EfficientSpatialChannelAttentionNet, self).__init__()
+        weights = EfficientNet_V2_S_Weights.DEFAULT
+        self.efficientnet = models.efficientnet_v2_s(weights=weights)
+
+        self.channel_attention1 = ChannelAttentionModule(in_planes=24)  # inputs for efficientnet block 1
+        self.spatial_attention1 = SpatialAttentionModule(kernel_size=7)
+        
+        self.channel_attention2 = ChannelAttentionModule(in_planes=48)  # inputs for efficientnet block 2
+        self.spatial_attention2 = SpatialAttentionModule(kernel_size=7)
+
+        # Get num of inputs for final classifier layer
+        num_ftrs = self.efficientnet.classifier[1].in_features
+
+        # Replace the default classifier with a custom one (Dropout + Linear layer)
+        self.efficientnet.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate, inplace=True),
+            nn.Linear(num_ftrs, num_classes)
+        )
+
+    def forward(self, x):
+        # Initial convolution and stem
+        x = self.efficientnet.features[0](x)
+
+        x = self.efficientnet.features[1](x)
+        x = self.channel_attention1(x)
+        x = self.spatial_attention1(x)
+
+        x = self.efficientnet.features[2](x)
+        x = self.channel_attention2(x)
+        x = self.spatial_attention2(x)
+
+        # keep forward passing as normal after attention
+        for i in range(3, len(self.efficientnet.features)):
+            x = self.efficientnet.features[i](x)
+
+        # Global average pooling and final classifier
+        x = self.efficientnet.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.efficientnet.classifier(x)
+
+        return x
+
+
 
 class ConvnextPredictor(nn.Module):
     def __init__(self, num_classes=6, freeze_layers=True):
@@ -462,6 +507,9 @@ def train_and_save(config):
     elif config['model'] == 'EfficientChannelAttentionNet':
         model = EfficientChannelAttentionNet(dropout_rate=config['dropout_rate'])
         optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    elif config['model'] == 'EfficientSpatialChannelAttentionNet':
+        model = EfficientSpatialChannelAttentionNet(dropout_rate=config['dropout_rate'])
+        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     elif config['model'] == 'ConvnextPredictor':
         model = ConvnextPredictor(num_classes=config['num_classes'], freeze_layers=config['freeze_layers'])
         optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
@@ -507,3 +555,22 @@ def get_optimal_num_workers():
         return 0
     else:
         return multiprocessing.cpu_count()
+    
+
+
+class MajorityVoteEnsemble(nn.Module):
+    def __init__(self, models):
+        super(MajorityVoteEnsemble, self).__init__()
+        self.models = models
+
+    def forward(self, x):
+        # Collect predictions from all models
+        outputs = [model(x) for model in self.models]  # Each model outputs predicted labels
+
+        # Stack outputs to get shape: (num_models, batch_size)
+        outputs = torch.stack(outputs)  # Shape: (num_models, batch_size)
+        outputs = outputs.transpose(0, 1)  # Shape: (batch_size, num_models)
+        
+        # Majority vote across models
+        majority_vote, _ = torch.mode(outputs, dim=1)  # Shape: (batch_size,)
+        return majority_vote
