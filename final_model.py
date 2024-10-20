@@ -549,6 +549,8 @@ def train_model_full_dataset(model, train_loader, criterion, optimizer, schedule
 
     return model
 
+import matplotlib.pyplot as plt
+
 def train_model_split(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience, device):
     model.to(device)
     id = generate_model_id()
@@ -559,6 +561,10 @@ def train_model_split(model, train_loader, val_loader, criterion, optimizer, sch
     best_val_loss = float('inf')
     best_val_acc = 0
     best_val_class_performance = None
+    train_losses = []
+    train_accuracies = []
+    val_losses = []
+    val_accuracies = []
     
     for epoch in range(num_epochs):
         print(f'Epoch {epoch+1}/{num_epochs}')
@@ -579,12 +585,18 @@ def train_model_split(model, train_loader, val_loader, criterion, optimizer, sch
         # If learning rate changed, add to schedule
         if new_lr != old_lr:
             lr_schedule[epoch + 1] = new_lr
-
+        
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         print(f'Learning Rate: {scheduler.optimizer.param_groups[0]["lr"]:.6f}')
         print('-' * 60)
-
+        
+        # Store losses and accuracies
+        train_losses.append(train_loss)
+        train_accuracies.append(train_acc)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_acc)
+        
         # Early stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -600,8 +612,55 @@ def train_model_split(model, train_loader, val_loader, criterion, optimizer, sch
         if epochs_no_improve >= patience:
             print(f'Early stopping triggered after {epoch + 1} epochs')
             break
-
+    
+    plot_val_loss_acc(val_losses, val_accuracies, best_epoch, id)
+    plot_learning_curves(train_losses, val_losses, train_accuracies, val_accuracies, best_epoch, id)
+    
     return id, model, best_epoch, lr_schedule, best_val_loss, best_val_acc, best_val_class_performance
+
+def plot_val_loss_acc(val_losses, val_accuracies, best_epoch, model_id):
+    plt.figure(figsize=(10, 6))
+    plt.scatter(val_losses, val_accuracies, label='Validation')
+    
+    # Highlight the best epoch
+    best_loss = val_losses[best_epoch]
+    best_acc = val_accuracies[best_epoch]
+    plt.scatter(best_loss, best_acc, color='red', s=100, zorder=5, label=f'Best Epoch ({best_epoch+1})')
+    plt.xlabel('Validation Loss')
+    plt.ylabel('Validation Accuracy (%)')
+    plt.title('Validation Loss vs Accuracy')
+    plt.legend()
+    plt.savefig(f'./visualisations/val_loss_acc_{model_id}.png')
+    plt.close()
+
+def plot_learning_curves(train_losses, val_losses, train_accuracies, val_accuracies, best_epoch, model_id):
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.figure(figsize=(12, 10))
+    
+    # Plot training & validation loss
+    plt.subplot(2, 1, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
+    plt.axvline(x=best_epoch+1, color='g', linestyle='--', label=f'Best Epoch ({best_epoch+1})')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    # Plot training & validation accuracy
+    plt.subplot(2, 1, 2)
+    plt.plot(epochs, train_accuracies, 'b-', label='Training Accuracy')
+    plt.plot(epochs, val_accuracies, 'r-', label='Validation Accuracy')
+    plt.axvline(x=best_epoch+1, color='g', linestyle='--', label=f'Best Epoch ({best_epoch+1})')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'./visualisations/learning_curves_{model_id}.png')
+    plt.close()
 
 def run_epoch(model, data_loader, criterion, optimizer, device, is_training=True, return_class_performance=False):
     running_loss = 0.0
@@ -1034,22 +1093,22 @@ def load_config_from_results(config, results_file, model_id=None):
 
     # Update config with values from the results file
     config.update({
-        'model': result['model'],
-        'target_column': result['target_column'],
-        'additional_columns': json.loads(result['additional_columns']) if result['additional_columns'] else [],
-        'balance_dataset': result['balance_dataset'] == 'True',
-        'use_augmentation': result['use_augmentation'] == 'True',
-        'use_quantized': result['use_quantized'] == 'True',
-        'batch_size': int(float(result['batch_size'])),
-        'dropout_rate': float(result['dropout_rate']),
-        'weight_decay': float(result['weight_decay']),
+        'model': result.get('model', config['model']),
+        'target_column': result.get('target_column', config['target_column']),
+        'additional_columns': json.loads(result['additional_columns']) if result.get('additional_columns') else [],
+        'balance_dataset': result.get('balance_dataset', 'False') == 'True',
+        'use_augmentation': result.get('use_augmentation', 'False') == 'True',
+        'use_quantized': result.get('use_quantized', 'False') == 'True',
+        'batch_size': int(float(result['batch_size'])) if result.get('batch_size') else config['batch_size'],
+        'dropout_rate': float(result['dropout_rate']) if result.get('dropout_rate') else config['dropout_rate'],
+        'weight_decay': float(result['weight_decay']) if result.get('weight_decay') else config['weight_decay'],
     })
     
     # Load training parameters
     training_params = {
-        'epochs': int(float(result['epochs'])),
-        'initial_lr': float(result['initial_lr']),
-        'lr_schedule': json.loads(result['lr_schedule'].replace('""', '"'))
+        'epochs': int(result['epochs']) if result.get('epochs') else int(result.get('epochs', 1)),
+        'initial_lr': float(result['learning_rate']) if result.get('learning_rate') else float(result.get('initial_lr', 0.001)),
+        'lr_schedule': json.loads(result['lr_schedule'].replace('""', '"')) if result.get('lr_schedule') else {'0': float(result.get('learning_rate', 0.001))}
     }
     
     return config, training_params
